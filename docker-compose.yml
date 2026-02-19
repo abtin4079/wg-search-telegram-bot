@@ -1,0 +1,10 @@
+services:
+  wg-bot:
+    build: .
+    container_name: wg-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./last_seen_erlangen.txt:/app/last_seen_erlangen.txt
+      - ./last_seen_nuernberg.txt:/app/last_seen_nuernberg.txt
