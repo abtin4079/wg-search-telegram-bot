@@ -1,0 +1,26 @@
+# Debug files
+wg_debug.html
+
+# Local state files
+last_seen_*.txt
+
+# Environment variables
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# macOS
+.DS_Store
+
+#vs code
+.vscode/
+
+# file
+last_seen_*.txt/
+last_seen.txt
