@@ -1,132 +1,176 @@
-import os
-from dotenv import load_dotenv
+"""Main Telegram bot application."""
+
+import logging
+from datetime import datetime
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
 from auto_check import fetch_latest_listing_links
-from commands import start, ping, myid, check
-# --------------------
-# Load env
-# --------------------
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+from cache import listing_cache, rate_limiter
+from commands import check, myid, ping, start, status
+from config import (
+    CHECK_INTERVAL_SECONDS,
+    LAST_SEEN_FILE_ERLANGEN,
+    LAST_SEEN_FILE_NUERNBERG,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_IDS,
+    WG_SEARCH_URL_ERLANGEN,
+    WG_SEARCH_URL_NUERNBERG,
+    validate_config,
+)
+from state import bot_start_time, metrics
+from utils import load_last_seen, save_last_seen
 
-# NEW: multiple chat IDs
-CHAT_IDS_RAW = os.getenv("TELEGRAM_CHAT_IDS", "")
-CHAT_ID_LIST = [int(cid.strip()) for cid in CHAT_IDS_RAW.split(",") if cid.strip()]
-
-WG_SEARCH_URL_ERLANGEN = os.getenv("WG_SEARCH_URL_ERLANGEN")
-WG_SEARCH_URL_NUERNBERG = os.getenv("WG_SEARCH_URL_NUERNBERG")
-CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "180"))  # default 3 minutes
-LAST_SEEN_ERLANGEN = "last_seen_erlangen.txt"
-LAST_SEEN_NUERNBERG = "last_seen_nuernberg.txt"
-
-
-# --------------------
-# Save / load last seen listing (avoid duplicates)
-# --------------------
-def load_last_seen(last_seen: str) -> str:
-    try:
-        with open(last_seen, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return ""
+logger = logging.getLogger(__name__)
 
 
-def save_last_seen(value: str, last_seen: str):
-    with open(last_seen, "w", encoding="utf-8") as f:
-        f.write(value)
-
-
-
-
-# --------------------
-# Helper: send message to all users
-# --------------------
-async def send_to_all(bot, text: str):
-    for chat_id in CHAT_ID_LIST:
+async def send_to_all(bot, text: str) -> None:
+    """Send message to all configured chat IDs.
+    
+    Args:
+        bot: The Telegram bot instance
+        text: The message text to send
+    """
+    for chat_id in TELEGRAM_CHAT_IDS:
         try:
-            await bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            # If one user didn't start the bot, Telegram will reject; ignore and continue
-            pass
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            logger.debug(f"Message sent to chat {chat_id}")
+            metrics["notifications_sent"] += 1
+        except Exception as e:
+            logger.error(f"Failed to send message to chat {chat_id}: {e}")
+            metrics["errors"] += 1
 
 
-# --------------------
-# Automatic check job (runs every CHECK_SECONDS)
-# --------------------
-async def auto_check(context: ContextTypes.DEFAULT_TYPE):
+async def auto_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Automatic job to check for new listings.
+    
+    This job runs periodically and checks if there are new listings,
+    notifying all users if a new listing is found.
+    """
     job_data = context.job.data
-    WG_SEARCH_URL = job_data["url"]
-    LAST_SEEN = job_data["file"]
+    search_url = job_data["url"]
+    last_seen_file = job_data["file"]
     city = job_data["city"]
+    city_key = city.lower()
 
-    if not WG_SEARCH_URL or not CHAT_ID_LIST:
+    if not search_url or not TELEGRAM_CHAT_IDS:
+        logger.debug(f"Skipping check for {city}: missing config or recipients")
         return
 
     try:
-        links = fetch_latest_listing_links(WG_SEARCH_URL, limit=1)
+        # Apply rate limiting to avoid being blocked
+        await rate_limiter.wait_if_needed(search_url)
+        
+        metrics["checks_total"] += 1
+        links = fetch_latest_listing_links(search_url, limit=1)
         if not links:
             return
 
-        latest = links[0]
-        last_seen = load_last_seen(LAST_SEEN)
+        latest_link = links[0]
+        last_seen = load_last_seen(last_seen_file)
 
-        if latest != last_seen:
-            save_last_seen(latest, LAST_SEEN)
+        # Check if we've already notified about this listing (cache check)
+        if listing_cache.has_seen(city_key, latest_link):
+            logger.debug(f"Listing already in cache for {city}: {latest_link}")
+            return
+
+        if latest_link != last_seen:
+            save_last_seen(latest_link, last_seen_file)
+            listing_cache.add(city_key, latest_link)
+            metrics["listings_found"] += 1
             await send_to_all(
                 context.bot,
-                f"🏠 New WG-Gesucht listing in {city}:\n{latest}"
+                f"<b>🏠 New WG-Gesucht listing in {city}</b>\n"
+                f"<a href='{latest_link}'>View Apartment</a>"
             )
+            logger.info(f"New listing found in {city}: {latest_link}")
+        else:
+            logger.debug(f"No new listings in {city}")
 
     except Exception as e:
-        await send_to_all(context.bot, f"Bot error ({city}):\n{e}")
+        logger.error(f"Error checking {city}: {e}", exc_info=True)
+        metrics["errors"] += 1
+        # Continue running despite errors - improved error recovery
+        try:
+            await send_to_all(context.bot, f"⚠️ Bot error ({city}): {str(e)[:100]}")
+        except Exception:
+            logger.error("Failed to send error notification", exc_info=True)
 
 
-# --------------------
-# Main
-# --------------------
-def main():
-    if not TOKEN:
-        raise SystemExit("Missing TELEGRAM_BOT_TOKEN in .env")
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle bot errors globally.
+    
+    Args:
+        update: The update that caused the error
+        context: The error context
+    """
+    logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
+    metrics["errors"] += 1
+    
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "❌ An unexpected error occurred. Please try again later."
+            )
+        except Exception as e:
+            logger.error(f"Failed to send error message: {e}")
 
-    if not CHAT_ID_LIST:
-        print("WARNING: TELEGRAM_CHAT_IDS is empty in .env (no one will receive messages).")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+
+def main() -> None:
+    """Initialize and run the bot."""
+    try:
+        validate_config()
+    except ValueError as e:
+        logger.critical(f"Configuration error: {e}")
+        raise SystemExit(str(e))
+
+    logger.info("Starting WG-Gesucht Telegram Bot...")
+    
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("check", check))
+    app.add_handler(CommandHandler("status", status))
 
-    # ✅ Run automatic checker every 3 minutes (or CHECK_SECONDS from .env)
-    # Erlangen checker
-    app.job_queue.run_repeating(
-        auto_check,
-        interval=CHECK_SECONDS,
-        first=10,
-        data={
-            "url": WG_SEARCH_URL_ERLANGEN,
-            "file": LAST_SEEN_ERLANGEN,
-            "city": "Erlangen"
-        }
-    )
+    app.add_error_handler(error_handler)
 
-    # Nürnberg checker
-    app.job_queue.run_repeating(
-        auto_check,
-        interval=CHECK_SECONDS,
-        first=15,
-        data={
-            "url": WG_SEARCH_URL_NUERNBERG,
-            "file": LAST_SEEN_NUERNBERG,
-            "city": "Nürnberg"
-        }
-    )
+    if WG_SEARCH_URL_ERLANGEN:
+        logger.info("Starting Erlangen checker")
+        app.job_queue.run_repeating(
+            auto_check,
+            interval=CHECK_INTERVAL_SECONDS,
+            first=10,
+            data={
+                "url": WG_SEARCH_URL_ERLANGEN,
+                "file": LAST_SEEN_FILE_ERLANGEN,
+                "city": "Erlangen",
+            },
+        )
+    else:
+        logger.warning("Erlangen checker disabled (URL not configured)")
 
+    if WG_SEARCH_URL_NUERNBERG:
+        logger.info("Starting Nürnberg checker")
+        app.job_queue.run_repeating(
+            auto_check,
+            interval=CHECK_INTERVAL_SECONDS,
+            first=15,
+            data={
+                "url": WG_SEARCH_URL_NUERNBERG,
+                "file": LAST_SEEN_FILE_NUERNBERG,
+                "city": "Nürnberg",
+            },
+        )
+    else:
+        logger.warning("Nürnberg checker disabled (URL not configured)")
 
-    print("Bot is running...")
+    logger.info("Bot is running... (Press Ctrl+C to stop)")
     app.run_polling()
+
 
 
 if __name__ == "__main__":
